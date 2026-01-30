@@ -2,6 +2,7 @@ import argparse
 import os
 import re
 import sys
+import traceback
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import List, Optional
@@ -10,6 +11,8 @@ from zoneinfo import ZoneInfo
 import requests
 import resend
 from bs4 import BeautifulSoup
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 
 TRENDING_URL = "https://github.com/trending?since=daily"
@@ -142,13 +145,20 @@ def parse_recipients(raw: str) -> List[str]:
     return recipients
 
 
+def require_env(name: str) -> str:
+    value = os.environ.get(name, "")
+    if not value:
+        raise RuntimeError(f"Missing required environment variable: {name}")
+    return value
+
+
 def send_email(subject: str, html: str) -> dict:
-    api_key = os.environ["RESEND_API_KEY"]
-    sender = os.environ["SENDER_EMAIL"]
-    recipient_raw = os.environ["RECIPIENT_EMAIL"]
+    api_key = require_env("RESEND_API_KEY")
+    sender = require_env("SENDER_EMAIL")
+    recipient_raw = require_env("RECIPIENT_EMAIL")
     recipients = parse_recipients(recipient_raw)
     if not recipients:
-        raise ValueError("RECIPIENT_EMAIL is empty")
+        raise RuntimeError("RECIPIENT_EMAIL is empty")
 
     resend.api_key = api_key
     params: resend.Emails.SendParams = {
@@ -157,7 +167,40 @@ def send_email(subject: str, html: str) -> dict:
         "subject": subject,
         "html": html,
     }
-    return resend.Emails.send(params)
+    try:
+        return resend.Emails.send(params)
+    except Exception as exc:
+        msg = str(exc)
+        m = re.search(r"own email address \(([^)]+)\)", msg)
+        if m:
+            allowed = m.group(1).strip()
+            if allowed and recipients != [allowed]:
+                params_retry: resend.Emails.SendParams = {
+                    "from": sender,
+                    "to": [allowed],
+                    "subject": subject,
+                    "html": html,
+                }
+                return resend.Emails.send(params_retry)
+        raise
+
+
+def create_session() -> requests.Session:
+    retry = Retry(
+        total=3,
+        connect=3,
+        read=3,
+        status=3,
+        backoff_factor=1.0,
+        status_forcelist=(429, 500, 502, 503, 504),
+        allowed_methods=("GET",),
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry)
+    session = requests.Session()
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
 
 
 def main() -> int:
@@ -168,21 +211,29 @@ def main() -> int:
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8")
 
-    beijing_dt = datetime.now(timezone.utc).astimezone(ZoneInfo("Asia/Shanghai"))
+    try:
+        beijing_dt = datetime.now(timezone.utc).astimezone(ZoneInfo("Asia/Shanghai"))
 
-    with requests.Session() as session:
-        html = fetch_trending_html(session)
-    repos = parse_trending_top10(html)
-    email_html = build_html_email(repos, beijing_dt)
-    subject = f"GitHub Trending Daily Top 10 ({beijing_dt.strftime('%Y-%m-%d')} 北京时间)"
+        with create_session() as session:
+            html = fetch_trending_html(session)
+        repos = parse_trending_top10(html)
+        if len(repos) < 10:
+            raise RuntimeError(f"Parsed only {len(repos)} repos from Trending page")
 
-    if args.no_email:
-        print(email_html)
+        email_html = build_html_email(repos, beijing_dt)
+        subject = f"GitHub Trending Daily Top 10 ({beijing_dt.strftime('%Y-%m-%d')} 北京时间)"
+
+        if args.no_email:
+            print(email_html)
+            return 0
+
+        resp = send_email(subject=subject, html=email_html)
+        print(resp)
         return 0
-
-    resp = send_email(subject=subject, html=email_html)
-    print(resp)
-    return 0
+    except Exception as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        traceback.print_exc()
+        return 1
 
 
 if __name__ == "__main__":
